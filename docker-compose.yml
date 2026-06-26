@@ -1,0 +1,110 @@
+
+version: "3.8"
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: ajora-postgres
+    environment:
+      POSTGRES_USER: ajora_admin
+      POSTGRES_PASSWORD: ajora_secure_password_2024
+      POSTGRES_DB: ajora
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./migrations:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ajora_admin"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - ajora-network
+
+  redis:
+    image: redis:7-alpine
+    container_name: ajora-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - ajora-network
+
+  auth-service:
+    build:
+      context: ./services/auth-service
+      dockerfile: Dockerfile
+    container_name: ajora-auth-service
+    environment:
+      PORT: 8081
+      DATABASE_URL: postgres://ajora_admin:ajora_secure_password_2024@postgres:5432/ajora?sslmode=disable
+      REDIS_ADDR: redis:6379
+      JWT_SECRET: ${JWT_SECRET:-super-secret-jwt-key-change-in-production}
+    ports:
+      - "8081:8081"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - ajora-network
+
+  user-service:
+    build:
+      context: ./services/user-service
+      dockerfile: Dockerfile
+    container_name: ajora-user-service
+    environment:
+      DATABASE_URL: postgres://ajora_admin:ajora_secure_password_2024@postgres:5432/ajora?sslmode=disable
+    ports:
+      - "8082:8082"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - ajora-network
+
+  pool-service:
+    build:
+      context: ./services/pool-service
+      dockerfile: Dockerfile
+    container_name: ajora-pool-service
+    environment:
+      DATABASE_URL: postgres://ajora_admin:ajora_secure_password_2024@postgres:5432/ajora?sslmode=disable
+    ports:
+      - "8083:8083"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - ajora-network
+
+  wallet-signer:
+    build:
+      context: ./services/wallet-signer
+      dockerfile: Dockerfile
+    container_name: ajora-wallet-signer
+    environment:
+      KMS_KEY_ID: ${KMS_KEY_ID:-alias/ajora-signing-key}
+      AWS_REGION: ${AWS_REGION:-us-west-2}
+    ports:
+      - "8088:8088"
+    networks:
+      - ajora-network
+
+volumes:
+  postgres-data:
+  redis-data:
+
+networks:
+  ajora-network:
+    driver: bridge
+

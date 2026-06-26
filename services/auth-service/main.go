@@ -3,93 +3,111 @@ package main
 
 import (
     "context"
-    "fmt"
+    "encoding/json"
     "log"
     "net/http"
     "os"
+    "os/signal"
+    "syscall"
     "time"
 
+    "github.com/ajora/auth-service/internal/auth"
     "github.com/ajora/auth-service/internal/config"
+    "github.com/ajora/auth-service/internal/db"
     "github.com/ajora/auth-service/internal/handlers"
     "github.com/ajora/auth-service/internal/middleware"
-    "github.com/ajora/auth-service/internal/repository"
-    "github.com/ajora/auth-service/internal/service"
     "github.com/gorilla/mux"
-    "github.com/jackc/pgx/v5/pgxpool"
-    "github.com/redis/go-redis/v9"
     "github.com/rs/cors"
+    "go.uber.org/zap"
 )
 
 func main() {
+    logger, _ := zap.NewProduction()
+    defer logger.Sync()
+    sugar := logger.Sugar()
+
     cfg := config.Load()
-    
-    pgConn, err := pgxpool.New(context.Background(), cfg.DatabaseURL)
+
+    // Initialize database
+    dbConn, err := db.Connect(cfg.DatabaseURL)
     if err != nil {
-        log.Fatalf("Unable to connect to database: %v", err)
+        sugar.Fatalf("Failed to connect to database: %v", err)
     }
-    defer pgConn.Close()
+    defer dbConn.Close()
 
-    rdb := redis.NewClient(&redis.Options{
-        Addr:     cfg.RedisAddr,
-        Password: cfg.RedisPassword,
-        DB:       cfg.RedisDB,
-    })
-    defer rdb.Close()
+    // Initialize Redis
+    redisClient := db.NewRedisClient(cfg.RedisAddr, cfg.RedisPassword, cfg.RedisDB)
 
-    userRepo := repository.NewUserRepository(pgConn)
-    authRepo := repository.NewAuthRepository(pgConn)
-    sessionRepo := repository.NewSessionRepository(rdb)
+    // Initialize services
+    authService := auth.NewService(dbConn, redisClient, cfg)
+    authHandler := handlers.NewAuthHandler(authService)
 
-    jwtService := service.NewJWTService(cfg.JWTSecret, cfg.JWTExpiry)
-    authService := service.NewAuthService(userRepo, authRepo, sessionRepo, jwtService)
-    mfaService := service.NewMFAService()
-    
-    authHandler := handlers.NewAuthHandler(authService, mfaService)
-    
     router := mux.NewRouter()
-    
+
+    // Health check
+    router.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+        json.NewEncoder(w).Encode(map[string]interface{}{
+            "status": "healthy",
+            "service": "auth-service",
+            "timestamp": time.Now().UTC().Format(time.RFC3339),
+        })
+    }).Methods("GET")
+
+    // Public routes
     router.HandleFunc("/api/v1/auth/register", authHandler.Register).Methods("POST")
     router.HandleFunc("/api/v1/auth/login", authHandler.Login).Methods("POST")
+    router.HandleFunc("/api/v1/auth/refresh", authHandler.Refresh).Methods("POST")
     router.HandleFunc("/api/v1/auth/verify-email", authHandler.VerifyEmail).Methods("POST")
     router.HandleFunc("/api/v1/auth/reset-password", authHandler.ResetPassword).Methods("POST")
-    router.HandleFunc("/api/v1/auth/refresh", authHandler.RefreshToken).Methods("POST")
-    
-    auth := router.PathPrefix("/api/v1/auth").Subrouter()
-    auth.Use(middleware.Authenticate(jwtService))
-    auth.HandleFunc("/logout", authHandler.Logout).Methods("POST")
-    auth.HandleFunc("/mfa/enable", authHandler.EnableMFA).Methods("POST")
-    auth.HandleFunc("/mfa/disable", authHandler.DisableMFA).Methods("POST")
-    auth.HandleFunc("/mfa/verify", authHandler.VerifyMFA).Methods("POST")
-    auth.HandleFunc("/change-password", authHandler.ChangePassword).Methods("PUT")
-    auth.HandleFunc("/sessions", authHandler.GetSessions).Methods("GET")
-    auth.HandleFunc("/sessions/{id}", authHandler.RevokeSession).Methods("DELETE")
+
+    // Protected routes
+    authRouter := router.PathPrefix("/api/v1/auth").Subrouter()
+    authRouter.Use(middleware.AuthMiddleware(cfg.JWTSecret))
+    authRouter.HandleFunc("/logout", authHandler.Logout).Methods("POST")
+    authRouter.HandleFunc("/change-password", authHandler.ChangePassword).Methods("PUT")
+    authRouter.HandleFunc("/mfa/enable", authHandler.EnableMFA).Methods("POST")
+    authRouter.HandleFunc("/mfa/verify", authHandler.VerifyMFA).Methods("POST")
+    authRouter.HandleFunc("/mfa/disable", authHandler.DisableMFA).Methods("POST")
+    authRouter.HandleFunc("/sessions", authHandler.GetSessions).Methods("GET")
+    authRouter.HandleFunc("/sessions/{id}", authHandler.RevokeSession).Methods("DELETE")
 
     c := cors.New(cors.Options{
-        AllowedOrigins:   []string{"https://api.ajora.com"},
+        AllowedOrigins:   []string{"*"},
         AllowedMethods:   []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
-        AllowedHeaders:   []string{"Authorization", "Content-Type", "X-Request-ID"},
-        ExposedHeaders:   []string{"X-Request-ID"},
+        AllowedHeaders:   []string{"Authorization", "Content-Type"},
         AllowCredentials: true,
-        MaxAge:           300,
     })
 
     handler := c.Handler(router)
-    handler = middleware.RateLimiter(rdb)(handler)
-    handler = middleware.RequestID(handler)
-    handler = middleware.Logger(handler)
-    handler = middleware.Recovery(handler)
+    handler = middleware.LoggingMiddleware(handler, sugar)
 
     srv := &http.Server{
         Handler:      handler,
-        Addr:         fmt.Sprintf(":%s", cfg.Port),
+        Addr:         ":" + cfg.Port,
         WriteTimeout: 15 * time.Second,
         ReadTimeout:  15 * time.Second,
         IdleTimeout:  60 * time.Second,
     }
 
-    log.Printf("Auth Service starting on port %s", cfg.Port)
-    if err := srv.ListenAndServe(); err != nil {
-        log.Fatalf("Server failed: %v", err)
+    go func() {
+        sugar.Infof("Auth Service starting on port %s", cfg.Port)
+        if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+            sugar.Fatalf("Failed to start server: %v", err)
+        }
+    }()
+
+    quit := make(chan os.Signal, 1)
+    signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+    <-quit
+
+    sugar.Info("Shutting down auth service...")
+    ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+    defer cancel()
+
+    if err := srv.Shutdown(ctx); err != nil {
+        sugar.Fatalf("Server forced to shutdown: %v", err)
     }
+
+    sugar.Info("Auth service exited")
 }
 
