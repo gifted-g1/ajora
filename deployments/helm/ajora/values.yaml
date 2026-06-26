@@ -1,0 +1,107 @@
+
+global:
+  environment: production
+  namespace: production
+  
+  image:
+    registry: 123456789012.dkr.ecr.us-west-2.amazonaws.com
+    pullPolicy: IfNotPresent
+    
+  resources:
+    limits:
+      cpu: 1000m
+      memory: 1Gi
+    requests:
+      cpu: 500m
+      memory: 512Mi
+
+  networkPolicies:
+    enabled: true
+    
+  serviceMesh:
+    enabled: true
+    provider: istio
+
+apiGateway:
+  enabled: true
+  replicaCount: 3
+  
+  image:
+    repository: ajora-api-gateway
+    tag: latest
+    
+  service:
+    type: LoadBalancer
+    port: 80
+    targetPort: 8080
+    
+  resources:
+    limits:
+      cpu: 2000m
+      memory: 2Gi
+    requests:
+      cpu: 1000m
+      memory: 1Gi
+    
+  autoscaling:
+    enabled: true
+    minReplicas: 3
+    maxReplicas: 10
+    targetCPUUtilizationPercentage: 70
+    targetMemoryUtilizationPercentage: 80
+    
+  ingress:
+    enabled: true
+    className: nginx
+    annotations:
+      cert-manager.io/cluster-issuer: letsencrypt-prod
+      nginx.ingress.kubernetes.io/ssl-redirect: "true"
+      nginx.ingress.kubernetes.io/limit-rps: "100"
+    hosts:
+      - host: api.ajora.com
+        paths:
+          - path: /
+            pathType: Prefix
+    tls:
+      - secretName: ajora-tls
+        hosts:
+          - api.ajora.com
+
+authService:
+  enabled: true
+  replicaCount: 3
+  
+  image:
+    repository: ajora-auth-service
+    tag: latest
+    
+  resources:
+    limits:
+      cpu: 1000m
+      memory: 1Gi
+    requests:
+      cpu: 500m
+      memory: 512Mi
+    
+  autoscaling:
+    enabled: true
+    minReplicas: 3
+    maxReplicas: 10
+    targetCPUUtilizationPercentage: 70
+    
+  env:
+    - name: PORT
+      value: "8080"
+    - name: DB_HOST
+      value: ajora-postgresql
+    - name: DB_NAME
+      value: ajora
+    - name: DB_USER
+      value: ajora_admin
+    - name: REDIS_HOST
+      value: ajora-redis-master
+    - name: REDIS_PORT
+      value: "6379"
+    - name: JWT_EXPIRY
+      value: "1h"
+
