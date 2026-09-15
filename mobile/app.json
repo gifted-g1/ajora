@@ -1,0 +1,26 @@
+{
+  "expo": {
+    "name": "Ajora",
+    "slug": "ajora",
+    "scheme": "ajora",
+    "version": "0.1.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "light",
+    "newArchEnabled": true,
+    "splash": {
+      "backgroundColor": "#1E1B4B",
+      "resizeMode": "contain"
+    },
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "ai.ajora.app"
+    },
+    "android": {
+      "package": "ai.ajora.app"
+    },
+    "plugins": ["expo-router", "expo-secure-store"],
+    "experiments": {
+      "typedRoutes": true
+    }
+  }
+}
